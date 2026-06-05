@@ -1,0 +1,15 @@
+"window.title" = "MetalMatrix Options";
+"label.density" = "Glyph density";
+"label.speed" = "Glyph speed";
+"label.encoding" = "Encoding";
+"option.fog" = "Fog";
+"option.waves" = "Waves";
+"option.panning" = "Panning";
+"option.fps" = "Show frame rate";
+"button.defaults" = "Defaults";
+"button.cancel" = "Cancel";
+"button.ok" = "OK";
+"mode.matrix" = "Matrix encoding";
+"mode.binary" = "Binary encoding";
+"mode.hexadecimal" = "Hexadecimal encoding";
+"mode.dna" = "Genetic encoding";

@@ -1,0 +1,15 @@
+"window.title" = "MetalMatrix 选项";
+"label.density" = "字符密度";
+"label.speed" = "字符速度";
+"label.encoding" = "编码";
+"option.fog" = "雾效";
+"option.waves" = "波纹";
+"option.panning" = "平移";
+"option.fps" = "显示帧率";
+"button.defaults" = "默认值";
+"button.cancel" = "取消";
+"button.ok" = "确定";
+"mode.matrix" = "Matrix 编码";
+"mode.binary" = "二进制编码";
+"mode.hexadecimal" = "十六进制编码";
+"mode.dna" = "基因编码";

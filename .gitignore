@@ -1,0 +1,6 @@
+.DS_Store
+.build/
+dist/
+
+# Local-only legacy binary used for visual comparison/reverse engineering.
+GLMatrix.saver/
