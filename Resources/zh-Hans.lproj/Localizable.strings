@@ -2,10 +2,14 @@
 "label.density" = "字符密度";
 "label.speed" = "字符速度";
 "label.encoding" = "编码";
+"label.frameRate" = "帧率";
 "option.fog" = "雾效";
 "option.waves" = "波纹";
 "option.panning" = "平移";
+"option.pauseDisplays" = "显示器睡眠时暂停";
 "option.fps" = "显示帧率";
+"option.debug" = "显示调试信息";
+"value.fps" = "%d FPS";
 "button.defaults" = "默认值";
 "button.cancel" = "取消";
 "button.ok" = "确定";

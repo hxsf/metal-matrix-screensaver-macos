@@ -67,6 +67,8 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
     private var viewTick = 0
     private var autoTracking = false
     private var trackTick = 0
+    private var lastFrameTime: CFTimeInterval = 0
+    private var simulationAccumulator: Double = 0
 
     private let gridSize = 70
     private let gridDepth: Float = 35
@@ -150,6 +152,8 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
 
     public func reset(size: CGSize) {
         currentSize = size
+        lastFrameTime = 0
+        simulationAccumulator = 0
         resetTracking()
         let stripCount = min(2_000, max(1, Int(settings.density * 2.2)))
         strips = (0..<stripCount).map { _ in
@@ -187,6 +191,7 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
         }
 
         let time = Float(CACurrentMediaTime() - startTime)
+        advanceSimulationForFrame()
         let instanceCount = updateInstances(buffer: instanceBuffer)
 
         var uniforms = Uniforms(
@@ -214,6 +219,36 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        frameRendered?(CACurrentMediaTime())
+    }
+
+    public var frameRendered: ((CFTimeInterval) -> Void)?
+
+    private func advanceSimulationForFrame() {
+        let now = CACurrentMediaTime()
+        let elapsed: CFTimeInterval
+        if lastFrameTime == 0 {
+            elapsed = 1.0 / 60.0
+        } else {
+            elapsed = min(max(now - lastFrameTime, 0), 0.25)
+        }
+        lastFrameTime = now
+
+        simulationAccumulator += elapsed * 60.0
+        let steps = min(8, Int(simulationAccumulator))
+        guard steps > 0 else { return }
+        simulationAccumulator -= Double(steps)
+        advanceSimulation(steps: steps)
+    }
+
+    private func advanceSimulation(steps: Int) {
+        let stepCount = max(1, min(8, steps))
+        for _ in 0..<stepCount {
+            for index in strips.indices {
+                tickStrip(index: index)
+            }
+            autoTrack()
+        }
     }
 
     private func updateInstances(buffer: MTLBuffer) -> Int {
@@ -223,7 +258,6 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
         let sortedIndexes = strips.indices.sorted { strips[$0].z < strips[$1].z }
 
         for index in sortedIndexes {
-            tickStrip(index: index)
             let strip = strips[index]
 
             for glyphIndex in 0..<gridSize {
@@ -255,7 +289,6 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        autoTrack()
         return count
     }
 

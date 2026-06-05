@@ -30,7 +30,8 @@ public enum MatrixMode: Int, CaseIterable {
 
 public struct MatrixSettings: Equatable {
     static let moduleName = "com.hxsf.MetalMatrix"
-    private static let currentSettingsVersion = 3
+    static let didChangeNotification = Notification.Name("MetalMatrixSettingsDidChange")
+    private static let currentSettingsVersion = 6
 
     var density: Float
     var speed: Float
@@ -39,15 +40,21 @@ public struct MatrixSettings: Equatable {
     var waves: Bool
     var rotate: Bool
     var showFPS: Bool
+    var showDebugInfo: Bool
+    var frameRate: Int
+    var pauseWhenDisplaysSleep: Bool
 
     static let standard = MatrixSettings(
-        density: 100,
+        density: 50,
         speed: 1,
         mode: .matrix,
         fog: true,
         waves: true,
         rotate: true,
-        showFPS: false
+        showFPS: false,
+        showDebugInfo: false,
+        frameRate: 30,
+        pauseWhenDisplaysSleep: true
     )
 
     static var defaults: ScreenSaverDefaults {
@@ -60,6 +67,9 @@ public struct MatrixSettings: Equatable {
             Keys.waves: NSNumber(value: standard.waves),
             Keys.rotate: NSNumber(value: standard.rotate),
             Keys.showFPS: NSNumber(value: standard.showFPS),
+            Keys.showDebugInfo: NSNumber(value: standard.showDebugInfo),
+            Keys.frameRate: NSNumber(value: standard.frameRate),
+            Keys.pauseWhenDisplaysSleep: NSNumber(value: standard.pauseWhenDisplaysSleep),
             Keys.settingsVersion: NSNumber(value: 0)
         ])
         return defaults
@@ -67,10 +77,7 @@ public struct MatrixSettings: Equatable {
 
     static func load() -> MatrixSettings {
         let defaults = MatrixSettings.defaults
-        if defaults.integer(forKey: Keys.settingsVersion) < currentSettingsVersion {
-            standard.save()
-            return standard
-        }
+        migrateDefaultsIfNeeded(defaults)
         let mode = MatrixMode(rawValue: defaults.integer(forKey: Keys.mode)) ?? .matrix
         return MatrixSettings(
             density: min(max(defaults.float(forKey: Keys.density), 0), 100),
@@ -79,8 +86,38 @@ public struct MatrixSettings: Equatable {
             fog: defaults.bool(forKey: Keys.fog),
             waves: defaults.bool(forKey: Keys.waves),
             rotate: defaults.bool(forKey: Keys.rotate),
-            showFPS: defaults.bool(forKey: Keys.showFPS)
+            showFPS: defaults.bool(forKey: Keys.showFPS),
+            showDebugInfo: defaults.bool(forKey: Keys.showDebugInfo),
+            frameRate: nearestFrameRate(defaults.integer(forKey: Keys.frameRate)),
+            pauseWhenDisplaysSleep: defaults.bool(forKey: Keys.pauseWhenDisplaysSleep)
         )
+    }
+
+    private static func migrateDefaultsIfNeeded(_ defaults: ScreenSaverDefaults) {
+        guard defaults.integer(forKey: Keys.settingsVersion) < currentSettingsVersion else { return }
+        setDefaultIfMissing(defaults, key: Keys.density, value: standard.density)
+        setDefaultIfMissing(defaults, key: Keys.speed, value: standard.speed)
+        setDefaultIfMissing(defaults, key: Keys.mode, value: standard.mode.rawValue)
+        setDefaultIfMissing(defaults, key: Keys.fog, value: standard.fog)
+        setDefaultIfMissing(defaults, key: Keys.waves, value: standard.waves)
+        setDefaultIfMissing(defaults, key: Keys.rotate, value: standard.rotate)
+        setDefaultIfMissing(defaults, key: Keys.showFPS, value: standard.showFPS)
+        setDefaultIfMissing(defaults, key: Keys.showDebugInfo, value: standard.showDebugInfo)
+        setDefaultIfMissing(defaults, key: Keys.frameRate, value: standard.frameRate)
+        setDefaultIfMissing(defaults, key: Keys.pauseWhenDisplaysSleep, value: standard.pauseWhenDisplaysSleep)
+        defaults.set(currentSettingsVersion, forKey: Keys.settingsVersion)
+        defaults.synchronize()
+    }
+
+    private static func setDefaultIfMissing(_ defaults: ScreenSaverDefaults, key: String, value: Any) {
+        guard defaults.object(forKey: key) == nil else { return }
+        defaults.set(value, forKey: key)
+    }
+
+    static let frameRateOptions = [15, 30, 60]
+
+    static func nearestFrameRate(_ value: Int) -> Int {
+        frameRateOptions.min { abs($0 - value) < abs($1 - value) } ?? standard.frameRate
     }
 
     func save() {
@@ -92,8 +129,12 @@ public struct MatrixSettings: Equatable {
         defaults.set(waves, forKey: Keys.waves)
         defaults.set(rotate, forKey: Keys.rotate)
         defaults.set(showFPS, forKey: Keys.showFPS)
+        defaults.set(showDebugInfo, forKey: Keys.showDebugInfo)
+        defaults.set(MatrixSettings.nearestFrameRate(frameRate), forKey: Keys.frameRate)
+        defaults.set(pauseWhenDisplaysSleep, forKey: Keys.pauseWhenDisplaysSleep)
         defaults.set(MatrixSettings.currentSettingsVersion, forKey: Keys.settingsVersion)
         defaults.synchronize()
+        NotificationCenter.default.post(name: MatrixSettings.didChangeNotification, object: nil)
     }
 
     private enum Keys {
@@ -104,6 +145,9 @@ public struct MatrixSettings: Equatable {
         static let waves = "waves"
         static let rotate = "rotate"
         static let showFPS = "showFPS"
+        static let showDebugInfo = "showDebugInfo"
+        static let frameRate = "frameRate"
+        static let pauseWhenDisplaysSleep = "pauseWhenDisplaysSleep"
         static let settingsVersion = "settingsVersion"
     }
 }
@@ -112,16 +156,19 @@ final class MatrixSettingsWindowController: NSWindowController {
     private let densitySlider = NSSlider(value: Double(MatrixSettings.standard.density), minValue: 0, maxValue: 100, target: nil, action: nil)
     private let speedSlider = NSSlider(value: Double(MatrixSettings.standard.speed), minValue: 0.1, maxValue: 8, target: nil, action: nil)
     private let modePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let frameRatePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
     private let fogButton = NSButton(checkboxWithTitle: MMString("option.fog"), target: nil, action: nil)
     private let wavesButton = NSButton(checkboxWithTitle: MMString("option.waves"), target: nil, action: nil)
     private let rotateButton = NSButton(checkboxWithTitle: MMString("option.panning"), target: nil, action: nil)
     private let fpsButton = NSButton(checkboxWithTitle: MMString("option.fps"), target: nil, action: nil)
+    private let debugButton = NSButton(checkboxWithTitle: MMString("option.debug"), target: nil, action: nil)
+    private let pauseDisplaysButton = NSButton(checkboxWithTitle: MMString("option.pauseDisplays"), target: nil, action: nil)
     private let densityValue = NSTextField(labelWithString: "")
     private let speedValue = NSTextField(labelWithString: "")
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 290),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 370),
             styleMask: [.titled],
             backing: .buffered,
             defer: false
@@ -154,6 +201,7 @@ final class MatrixSettingsWindowController: NSWindowController {
         ])
 
         MatrixMode.allCases.forEach { modePopUp.addItem(withTitle: $0.title) }
+        MatrixSettings.frameRateOptions.forEach { frameRatePopUp.addItem(withTitle: String(format: MMString("value.fps"), $0)) }
 
         densitySlider.target = self
         densitySlider.action = #selector(sliderChanged(_:))
@@ -163,8 +211,9 @@ final class MatrixSettingsWindowController: NSWindowController {
         stack.addArrangedSubview(row(label: MMString("label.density"), control: densitySlider, valueLabel: densityValue))
         stack.addArrangedSubview(row(label: MMString("label.speed"), control: speedSlider, valueLabel: speedValue))
         stack.addArrangedSubview(row(label: MMString("label.encoding"), control: modePopUp, valueLabel: nil))
+        stack.addArrangedSubview(row(label: MMString("label.frameRate"), control: frameRatePopUp, valueLabel: nil))
 
-        let checks = NSStackView(views: [fogButton, wavesButton, rotateButton, fpsButton])
+        let checks = NSStackView(views: [fogButton, wavesButton, rotateButton, pauseDisplaysButton, fpsButton, debugButton])
         checks.orientation = .vertical
         checks.spacing = 8
         stack.addArrangedSubview(checks)
@@ -177,10 +226,14 @@ final class MatrixSettingsWindowController: NSWindowController {
         buttons.orientation = .horizontal
         buttons.alignment = .centerY
         buttons.spacing = 8
+        let versionLabel = NSTextField(labelWithString: bundleVersionString())
+        versionLabel.textColor = .secondaryLabelColor
+        versionLabel.font = NSFont.systemFont(ofSize: 11)
         let defaultsButton = NSButton(title: MMString("button.defaults"), target: self, action: #selector(defaultsClicked(_:)))
         let cancelButton = NSButton(title: MMString("button.cancel"), target: self, action: #selector(cancelClicked(_:)))
         let okButton = NSButton(title: MMString("button.ok"), target: self, action: #selector(okClicked(_:)))
         okButton.keyEquivalent = "\r"
+        buttons.addArrangedSubview(versionLabel)
         buttons.addArrangedSubview(defaultsButton)
         buttons.addArrangedSubview(NSView())
         buttons.addArrangedSubview(cancelButton)
@@ -216,10 +269,15 @@ final class MatrixSettingsWindowController: NSWindowController {
         densitySlider.doubleValue = Double(settings.density)
         speedSlider.doubleValue = Double(settings.speed)
         modePopUp.selectItem(at: settings.mode.rawValue)
+        if let frameRateIndex = MatrixSettings.frameRateOptions.firstIndex(of: MatrixSettings.nearestFrameRate(settings.frameRate)) {
+            frameRatePopUp.selectItem(at: frameRateIndex)
+        }
         fogButton.state = settings.fog ? .on : .off
         wavesButton.state = settings.waves ? .on : .off
         rotateButton.state = settings.rotate ? .on : .off
         fpsButton.state = settings.showFPS ? .on : .off
+        debugButton.state = settings.showDebugInfo ? .on : .off
+        pauseDisplaysButton.state = settings.pauseWhenDisplaysSleep ? .on : .off
         updateValueLabels()
     }
 
@@ -231,7 +289,10 @@ final class MatrixSettingsWindowController: NSWindowController {
             fog: fogButton.state == .on,
             waves: wavesButton.state == .on,
             rotate: rotateButton.state == .on,
-            showFPS: fpsButton.state == .on
+            showFPS: fpsButton.state == .on,
+            showDebugInfo: debugButton.state == .on,
+            frameRate: MatrixSettings.frameRateOptions[max(0, min(MatrixSettings.frameRateOptions.count - 1, frameRatePopUp.indexOfSelectedItem))],
+            pauseWhenDisplaysSleep: pauseDisplaysButton.state == .on
         )
     }
 
@@ -256,6 +317,22 @@ final class MatrixSettingsWindowController: NSWindowController {
     private func updateValueLabels() {
         densityValue.stringValue = "\(Int(round(densitySlider.doubleValue)))%"
         speedValue.stringValue = String(format: "%.1fx", speedSlider.doubleValue)
+    }
+
+    private func bundleVersionString() -> String {
+        let bundle = Bundle(identifier: "com.hxsf.MetalMatrix") ?? Bundle(for: MatrixSettingsWindowController.self)
+        let shortVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let buildVersion = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        switch (shortVersion, buildVersion) {
+        case let (short?, build?) where short != build:
+            return "v\(short) (\(build))"
+        case let (short?, _):
+            return "v\(short)"
+        case let (_, build?):
+            return "v\(build)"
+        default:
+            return ""
+        }
     }
 
     private func endSheet(returnCode: NSApplication.ModalResponse) {

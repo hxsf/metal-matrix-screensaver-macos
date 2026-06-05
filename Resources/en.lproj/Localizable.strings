@@ -2,10 +2,14 @@
 "label.density" = "Glyph density";
 "label.speed" = "Glyph speed";
 "label.encoding" = "Encoding";
+"label.frameRate" = "Frame rate";
 "option.fog" = "Fog";
 "option.waves" = "Waves";
 "option.panning" = "Panning";
+"option.pauseDisplays" = "Pause when display sleeps";
 "option.fps" = "Show frame rate";
+"option.debug" = "Show debug info";
+"value.fps" = "%d FPS";
 "button.defaults" = "Defaults";
 "button.cancel" = "Cancel";
 "button.ok" = "OK";
