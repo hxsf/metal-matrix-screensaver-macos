@@ -33,6 +33,7 @@ for ARCH in $ARCHS; do
     -framework MetalKit \
     "$ROOT/Sources/MatrixSaverView.swift" \
     "$ROOT/Sources/MatrixSettings.swift" \
+    "$ROOT/Sources/MatrixSimulationCoordinator.swift" \
     "$ROOT/Sources/MatrixRenderer.swift" \
     -o "$ARCH_EXECUTABLE"
   ARCH_OUTPUTS+=("$ARCH_EXECUTABLE")

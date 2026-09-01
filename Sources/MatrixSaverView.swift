@@ -8,7 +8,7 @@ import ScreenSaver
 public final class MetalMatrixView: ScreenSaverView {
     private var metalView: MTKView?
     private var renderer: MatrixRenderer?
-    private let settingsController = MatrixSettingsWindowController()
+    private lazy var settingsController = MatrixSettingsWindowController()
     private let fpsLabel = NSTextField(labelWithString: "")
     private let debugLabel = NSTextField(labelWithString: "")
     private var fpsWidthConstraint: NSLayoutConstraint?
@@ -16,29 +16,38 @@ public final class MetalMatrixView: ScreenSaverView {
     private var debugWidthConstraint: NSLayoutConstraint?
     private var debugHeightConstraint: NSLayoutConstraint?
     private var currentSettings = MatrixSettings.load()
+    private var animationActive = false
+    private var rendererGeneration: UInt64 = 0
     private var renderingSuspended = true
     private var systemIsAsleep = false
     private var lastFPSUpdate = CACurrentMediaTime()
-    private var frameCounter = 0
+    private var lastPresentedFrameCount: UInt64 = 0
+    private var simulationReadyRequest: UInt64 = 0
+    private var waitingForSimulationReady = false
 
     public override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
+        DebugLifetimeRegistry.shared.register(view: self)
         animationTimeInterval = 1.0
         wantsLayer = true
         installPowerObservers()
-        setupMetalView()
+        setupFPSLabel()
+        setupDebugLabel()
     }
 
     @available(*, unavailable)
     public required init?(coder: NSCoder) {
         super.init(coder: coder)
+        DebugLifetimeRegistry.shared.register(view: self)
         animationTimeInterval = 1.0
         wantsLayer = true
         installPowerObservers()
-        setupMetalView()
+        setupFPSLabel()
+        setupDebugLabel()
     }
 
     deinit {
+        DebugLifetimeRegistry.shared.unregister(view: self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
     }
@@ -53,29 +62,27 @@ public final class MetalMatrixView: ScreenSaverView {
 
     public override func startAnimation() {
         super.startAnimation()
+        animationActive = true
+        DebugLifetimeRegistry.shared.setActive(view: self, active: true)
         applySettings(force: true)
-        renderer?.resume(size: bounds.size)
-        renderingSuspended = shouldSuspendForCurrentDisplay()
         lastFPSUpdate = CACurrentMediaTime()
-        frameCounter = 0
-        metalView?.isPaused = renderingSuspended
+        lastPresentedFrameCount = 0
+        updateRenderingState()
     }
 
     public override func stopAnimation() {
-        renderingSuspended = true
-        DebugDisplayRegistry.shared.mark(displayID: currentDisplayID, active: false, fps: nil)
-        metalView?.isPaused = true
+        animationActive = false
+        DebugLifetimeRegistry.shared.setActive(view: self, active: false)
+        updateRenderingState()
+        teardownMetalView()
         super.stopAnimation()
     }
 
     public override func animateOneFrame() {
-        renderingSuspended = shouldSuspendForCurrentDisplay()
-        if renderingSuspended {
-            DebugDisplayRegistry.shared.mark(displayID: currentDisplayID, active: false, fps: nil)
-            metalView?.isPaused = true
-        } else {
-            renderer?.resume(size: bounds.size)
-            metalView?.isPaused = false
+        updateRenderingState()
+        let now = CACurrentMediaTime()
+        if currentSettings.showDebugInfo && now - lastFPSUpdate > 0.8 {
+            updateDebugLabel(now: now)
         }
     }
 
@@ -83,6 +90,20 @@ public final class MetalMatrixView: ScreenSaverView {
         super.setFrameSize(newSize)
         metalView?.frame = bounds
         renderer?.resize(size: newSize)
+        if animationActive {
+            updateRenderingState()
+        }
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard animationActive else { return }
+
+        invalidateSimulationReadyWait()
+        metalView?.isPaused = true
+        DispatchQueue.main.async { [weak self] in
+            self?.updateRenderingState()
+        }
     }
 
     private func setupMetalView() {
@@ -96,7 +117,7 @@ public final class MetalMatrixView: ScreenSaverView {
         let view = MTKView(frame: bounds, device: device)
         view.autoresizingMask = [.width, .height]
         view.colorPixelFormat = .bgra8Unorm
-        view.depthStencilPixelFormat = .depth32Float
+        view.depthStencilPixelFormat = .invalid
         view.clearColor = MTLClearColor(red: 0.002, green: 0.004, blue: 0.002, alpha: 1.0)
         view.framebufferOnly = true
         view.enableSetNeedsDisplay = false
@@ -105,20 +126,34 @@ public final class MetalMatrixView: ScreenSaverView {
 
         do {
             let renderer = try MatrixRenderer(view: view, isPreview: isPreview)
-            renderer.frameRendered = { [weak self] now in
-                DispatchQueue.main.async {
-                    self?.updateOverlays(now: now)
-                }
-            }
+            rendererGeneration &+= 1
             view.delegate = renderer
-            addSubview(view)
+            if fpsLabel.superview === self {
+                addSubview(view, positioned: .below, relativeTo: fpsLabel)
+            } else {
+                addSubview(view)
+            }
             self.metalView = view
             setupFPSLabel()
             setupDebugLabel()
             self.renderer = renderer
+            configurePresentationCallback()
         } catch {
             NSLog("MetalMatrix: failed to initialize renderer: \(error)")
         }
+    }
+
+    private func teardownMetalView() {
+        guard metalView != nil || renderer != nil else { return }
+        invalidateSimulationReadyWait()
+        rendererGeneration &+= 1
+        metalView?.isPaused = true
+        metalView?.delegate = nil
+        renderer?.setFramePresentedHandler(minimumInterval: 0, handler: nil)
+        renderer?.shutdown()
+        metalView?.removeFromSuperview()
+        renderer = nil
+        metalView = nil
     }
 
     private func installPowerObservers() {
@@ -150,30 +185,87 @@ public final class MetalMatrixView: ScreenSaverView {
     }
 
     @objc private func displayStateChanged(_ notification: Notification) {
-        renderingSuspended = shouldSuspendForCurrentDisplay()
-        if renderingSuspended {
-            DebugDisplayRegistry.shared.mark(displayID: currentDisplayID, active: false, fps: nil)
-            metalView?.isPaused = true
-        } else {
-            renderer?.resume(size: bounds.size)
-            metalView?.isPaused = false
+        performOnMain { [weak self] in
+            self?.updateRenderingState()
         }
     }
 
     @objc private func systemWillSleep(_ notification: Notification) {
-        systemIsAsleep = true
-        renderingSuspended = true
-        metalView?.isPaused = true
+        performOnMain { [weak self] in
+            self?.systemIsAsleep = true
+            self?.updateRenderingState()
+        }
     }
 
     @objc private func systemDidWake(_ notification: Notification) {
-        systemIsAsleep = false
-        displayStateChanged(notification)
+        performOnMain { [weak self] in
+            self?.systemIsAsleep = false
+            self?.updateRenderingState()
+        }
     }
 
     @objc private func settingsDidChange(_ notification: Notification) {
-        applySettings(force: true)
-        displayStateChanged(notification)
+        performOnMain { [weak self] in
+            self?.invalidateSimulationReadyWait()
+            self?.metalView?.isPaused = true
+            self?.applySettings(force: true)
+            self?.updateRenderingState()
+        }
+    }
+
+    private func performOnMain(_ action: @escaping () -> Void) {
+        if Thread.isMainThread {
+            action()
+        } else {
+            DispatchQueue.main.async(execute: action)
+        }
+    }
+
+    private func updateRenderingState() {
+        let hasDrawableSize = bounds.width > 0 && bounds.height > 0
+        let isAttachedToWindow = window != nil
+        renderingSuspended = !animationActive || !hasDrawableSize || !isAttachedToWindow || shouldSuspendForCurrentDisplay()
+        if renderingSuspended {
+            invalidateSimulationReadyWait()
+            DebugDisplayRegistry.shared.mark(displayID: currentDisplayID, active: false, fps: nil)
+            metalView?.isPaused = true
+            renderer?.setSimulationActive(false)
+            return
+        }
+
+        setupMetalView()
+        guard metalView != nil, renderer != nil else {
+            renderingSuspended = true
+            return
+        }
+        metalView?.frame = bounds
+        renderer?.resume(size: bounds.size)
+        guard metalView?.isPaused == true,
+              let renderer else { return }
+        guard !waitingForSimulationReady else { return }
+        waitingForSimulationReady = true
+        simulationReadyRequest &+= 1
+        let readyRequest = simulationReadyRequest
+        let generation = rendererGeneration
+        renderer.whenSimulationReady { [weak self, weak renderer] in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.simulationReadyRequest == readyRequest else { return }
+                self.waitingForSimulationReady = false
+                guard let renderer,
+                      self.animationActive,
+                      !self.renderingSuspended,
+                      self.rendererGeneration == generation,
+                      self.renderer === renderer else { return }
+                self.metalView?.isPaused = false
+            }
+        }
+    }
+
+    private func invalidateSimulationReadyWait() {
+        guard waitingForSimulationReady else { return }
+        waitingForSimulationReady = false
+        simulationReadyRequest &+= 1
     }
 
     private func shouldSuspendForCurrentDisplay() -> Bool {
@@ -181,12 +273,12 @@ public final class MetalMatrixView: ScreenSaverView {
             return systemIsAsleep
         }
         if systemIsAsleep { return true }
-        if let window, !window.isVisible { return true }
         guard let screen = window?.screen else { return false }
         return screen.isDisplayAsleep
     }
 
     private func setupFPSLabel() {
+        guard fpsLabel.superview == nil else { return }
         fpsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: isPreview ? 10 : 13, weight: .medium)
         fpsLabel.textColor = NSColor(calibratedRed: 0.72, green: 1, blue: 0.64, alpha: 0.9)
         fpsLabel.drawsBackground = false
@@ -213,6 +305,7 @@ public final class MetalMatrixView: ScreenSaverView {
     }
 
     private func setupDebugLabel() {
+        guard debugLabel.superview == nil else { return }
         debugLabel.font = NSFont.monospacedSystemFont(ofSize: isPreview ? 9 : 12, weight: .medium)
         debugLabel.textColor = NSColor(calibratedRed: 0.72, green: 1, blue: 0.64, alpha: 0.9)
         debugLabel.drawsBackground = true
@@ -258,6 +351,7 @@ public final class MetalMatrixView: ScreenSaverView {
         animationTimeInterval = 1.0
         metalView?.preferredFramesPerSecond = frameRate
         renderer?.apply(settings: settings)
+        configurePresentationCallback()
         if changed || force {
             configureOverlayLabel(for: settings)
         }
@@ -274,8 +368,8 @@ public final class MetalMatrixView: ScreenSaverView {
             fpsLabel.alignment = .left
             fpsLabel.drawsBackground = true
             fpsLabel.backgroundColor = NSColor.black.withAlphaComponent(0.5)
-            fpsWidthConstraint?.constant = isPreview ? 260 : 430
-            fpsHeightConstraint?.constant = isPreview ? 86 : 118
+            fpsWidthConstraint?.constant = isPreview ? 330 : 700
+            fpsHeightConstraint?.constant = isPreview ? 210 : 270
         } else {
             fpsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: isPreview ? 10 : 13, weight: .medium)
             fpsLabel.alignment = .right
@@ -286,30 +380,73 @@ public final class MetalMatrixView: ScreenSaverView {
     }
 
     private func updateOverlays(now: CFTimeInterval) {
-        frameCounter += 1
         let elapsed = now - lastFPSUpdate
-        guard elapsed >= 0.4 else { return }
-        let fps = Double(frameCounter) / elapsed
+        let updateInterval: CFTimeInterval = currentSettings.showDebugInfo ? 1.0 : 0.4
+        guard elapsed >= updateInterval else { return }
+        let presentedFrames = renderer?.diagnosticsSnapshot().presentedFrames ?? lastPresentedFrameCount
+        let frameDelta = presentedFrames >= lastPresentedFrameCount
+            ? presentedFrames - lastPresentedFrameCount
+            : 0
+        let fps = Double(frameDelta) / elapsed
         DebugDisplayRegistry.shared.mark(displayID: currentDisplayID, active: true, fps: fps)
         if currentSettings.showDebugInfo {
             updateDebugLabel(now: now)
         } else if !fpsLabel.isHidden {
             fpsLabel.stringValue = String(format: "FPS %.1f / %d", fps, currentSettings.frameRate)
         }
-        frameCounter = 0
+        lastPresentedFrameCount = presentedFrames
         lastFPSUpdate = now
     }
 
+    private func configurePresentationCallback() {
+        guard let renderer else { return }
+        guard currentSettings.showFPS || currentSettings.showDebugInfo else {
+            renderer.setFramePresentedHandler(minimumInterval: 0, handler: nil)
+            return
+        }
+
+        lastPresentedFrameCount = renderer.diagnosticsSnapshot().presentedFrames
+        lastFPSUpdate = CACurrentMediaTime()
+        let generation = rendererGeneration
+        let interval: CFTimeInterval = currentSettings.showDebugInfo ? 1.0 : 0.4
+        renderer.setFramePresentedHandler(minimumInterval: interval) { [weak self, weak renderer] now in
+            DispatchQueue.main.async {
+                guard let self,
+                      let renderer,
+                      self.animationActive,
+                      self.rendererGeneration == generation,
+                      self.renderer === renderer else { return }
+                self.updateOverlays(now: now)
+            }
+        }
+    }
+
     private func updateDebugLabel(now: CFTimeInterval) {
+        let device = metalView?.device
+        let preferredDevice = metalView?.preferredDevice
+        let viewSnapshot = DebugViewSnapshot(
+            identifier: String(format: "%08X", UInt32(truncatingIfNeeded: ObjectIdentifier(self).hashValue)),
+            viewSize: bounds.size,
+            drawableSize: metalView?.drawableSize ?? .zero,
+            backingScale: window?.backingScaleFactor ?? 0,
+            animationActive: animationActive,
+            renderingSuspended: renderingSuspended,
+            paused: metalView?.isPaused ?? true,
+            attached: window != nil,
+            visible: window?.isVisible ?? false,
+            occluded: window?.occlusionState.contains(.visible) ?? false,
+            screenName: window?.screen?.localizedName ?? "n/a",
+            deviceName: device?.name ?? "n/a",
+            deviceRegistryID: device?.registryID,
+            preferredDeviceRegistryID: preferredDevice?.registryID
+        )
         let text = DebugOverlay.snapshot(currentDisplayID: currentDisplayID,
-                                         device: metalView?.device,
-                                         targetFrameRate: currentSettings.frameRate)
+                                         device: device,
+                                         targetFrameRate: currentSettings.frameRate,
+                                         view: viewSnapshot,
+                                         renderer: renderer?.diagnosticsSnapshot(),
+                                         now: now)
         fpsLabel.stringValue = text
-        fpsLabel.invalidateIntrinsicContentSize()
-        debugLabel.stringValue = text
-        debugLabel.invalidateIntrinsicContentSize()
-        needsLayout = true
-        layoutSubtreeIfNeeded()
     }
 
     private var currentDisplayID: CGDirectDisplayID? {
@@ -330,6 +467,66 @@ private extension NSScreen {
             return false
         }
         return CGDisplayIsAsleep(displayID) != 0
+    }
+}
+
+struct DebugLifetimeSnapshot {
+    var views: Int
+    var activeViews: Int
+    var renderers: Int
+}
+
+final class DebugLifetimeRegistry {
+    static let shared = DebugLifetimeRegistry()
+
+    private var views: Set<ObjectIdentifier> = []
+    private var activeViews: Set<ObjectIdentifier> = []
+    private var renderers: Set<ObjectIdentifier> = []
+    private let lock = NSLock()
+
+    func register(view: MetalMatrixView) {
+        lock.lock()
+        views.insert(ObjectIdentifier(view))
+        lock.unlock()
+    }
+
+    func unregister(view: MetalMatrixView) {
+        let identifier = ObjectIdentifier(view)
+        lock.lock()
+        views.remove(identifier)
+        activeViews.remove(identifier)
+        lock.unlock()
+    }
+
+    func setActive(view: MetalMatrixView, active: Bool) {
+        let identifier = ObjectIdentifier(view)
+        lock.lock()
+        if active {
+            activeViews.insert(identifier)
+        } else {
+            activeViews.remove(identifier)
+        }
+        lock.unlock()
+    }
+
+    func register(renderer: MatrixRenderer) {
+        lock.lock()
+        renderers.insert(ObjectIdentifier(renderer))
+        lock.unlock()
+    }
+
+    func unregister(renderer: MatrixRenderer) {
+        lock.lock()
+        renderers.remove(ObjectIdentifier(renderer))
+        lock.unlock()
+    }
+
+    func snapshot() -> DebugLifetimeSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return DebugLifetimeSnapshot(views: views.count,
+                                     activeViews: activeViews.count,
+                                     renderers: renderers.count)
     }
 }
 
@@ -381,15 +578,94 @@ private final class DebugDisplayRegistry {
     }
 }
 
+private struct DebugViewSnapshot {
+    var identifier: String
+    var viewSize: CGSize
+    var drawableSize: CGSize
+    var backingScale: CGFloat
+    var animationActive: Bool
+    var renderingSuspended: Bool
+    var paused: Bool
+    var attached: Bool
+    var visible: Bool
+    var occluded: Bool
+    var screenName: String
+    var deviceName: String
+    var deviceRegistryID: UInt64?
+    var preferredDeviceRegistryID: UInt64?
+}
+
 private enum DebugOverlay {
-    static func snapshot(currentDisplayID: CGDirectDisplayID?, device: MTLDevice?, targetFrameRate: Int) -> String {
+    private static let version = versionString()
+
+    static func snapshot(currentDisplayID: CGDirectDisplayID?,
+                         device: MTLDevice?,
+                         targetFrameRate: Int,
+                         view: DebugViewSnapshot,
+                         renderer: MatrixRendererDiagnostics?,
+                         now: CFTimeInterval) -> String {
         let process = ProcessMetricsSampler.shared.sample()
-        var lines = ["MetalMatrix debug  target \(targetFrameRate) fps"]
+        let lifetime = DebugLifetimeRegistry.shared.snapshot()
+        var lines = ["MetalMatrix \(version) debug  target \(targetFrameRate) fps  view \(view.identifier)"]
         lines.append(contentsOf: DebugDisplayRegistry.shared.lines(currentDisplayID: currentDisplayID))
-        lines.append(String(format: "CPU %.1f%%  MEM %@", process.cpuPercent, formatBytes(process.residentBytes)))
+        lines.append("state active \(flag(view.animationActive)) suspended \(flag(view.renderingSuspended)) paused \(flag(view.paused)) win(a/v/o) \(flag(view.attached))/\(flag(view.visible))/\(flag(view.occluded))")
+        lines.append("objects views \(lifetime.views) active \(lifetime.activeViews) renderers \(lifetime.renderers)")
+        lines.append(String(format: "size %.0fx%.0f drawable %.0fx%.0f scale %.1f  %@",
+                            view.viewSize.width, view.viewSize.height,
+                            view.drawableSize.width, view.drawableSize.height,
+                            view.backingScale, view.screenName))
+        if let renderer {
+            lines.append("render inst \(renderer.instanceCount)/\(renderer.instanceCapacity) strips \(renderer.stripCount) submit \(renderer.submittedFrames) slot \(renderer.frameSlot)/\(renderer.simulationSlot) seq \(renderer.simulationSequence)")
+            lines.append("metal done \(renderer.completedFrames) present \(renderer.presentedFrames) drop \(renderer.skippedPresentations) err \(renderer.commandErrors)")
+            lines.append("miss(d/c/e/r) \(renderer.drawableMisses)/\(renderer.commandBufferMisses)/\(renderer.encoderMisses)/\(renderer.resourceMisses)")
+            lines.append("inflight \(renderer.inFlightFrames)/3 peak \(renderer.peakInFlightFrames) skip \(renderer.inFlightSkips)")
+            let simulation = renderer.simulation
+            lines.append("cpuq ready \(simulation.readyFrames)/\(simulation.ringCapacity) prep \(simulation.preparingFrames) readers \(simulation.gpuReaders) displays \(simulation.activeConsumers) rings \(simulation.liveCoordinators) qos utility")
+            lines.append(String(format: "cpuq made %llu take %llu stale %llu starve %llu prep %.3f/%.3f ms",
+                                simulation.producedFrames, simulation.consumedFrames,
+                                simulation.staleFrames, simulation.starvedFrames,
+                                simulation.lastPreparationMilliseconds,
+                                simulation.averagePreparationMilliseconds))
+            let presentAge = renderer.lastPresentedTime > 0 ? max(0, now - renderer.lastPresentedTime) : -1
+            lines.append(String(format: "GPU frame %.3f ms  present age %.3f s", renderer.gpuMilliseconds, presentAge))
+            if let error = renderer.lastError {
+                lines.append("Metal error: \(error)")
+            }
+        } else {
+            lines.append("renderer unavailable")
+        }
+        lines.append("device \(view.deviceName) id \(hexID(view.deviceRegistryID)) pref \(hexID(view.preferredDeviceRegistryID))")
+        let allCorePercent = process.cpuPercent / Double(max(1, ProcessInfo.processInfo.activeProcessorCount))
+        lines.append(String(format: "CPU %.1f%% (1c=100) all %.1f%%  MEM %@",
+                            process.cpuPercent, allCorePercent, formatBytes(process.residentBytes)))
         let gmem = device.map { formatBytes(UInt64($0.currentAllocatedSize)) } ?? "n/a"
         lines.append("GPU global n/a  GMEM self \(gmem)")
         return lines.joined(separator: "\n")
+    }
+
+    private static func flag(_ value: Bool) -> Int {
+        value ? 1 : 0
+    }
+
+    private static func versionString() -> String {
+        let bundle = Bundle(identifier: "com.hxsf.MetalMatrix") ?? Bundle(for: MetalMatrixView.self)
+        let shortVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let buildVersion = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        switch (shortVersion, buildVersion) {
+        case let (short?, build?) where short != build:
+            return "v\(short) (\(build))"
+        case let (short?, _):
+            return "v\(short)"
+        case let (_, build?):
+            return "v\(build)"
+        default:
+            return "unknown"
+        }
+    }
+
+    private static func hexID(_ value: UInt64?) -> String {
+        guard let value else { return "n/a" }
+        return String(format: "%llX", value)
     }
 
     private static func formatBytes(_ bytes: UInt64) -> String {
@@ -406,6 +682,8 @@ private final class ProcessMetricsSampler {
 
     private var lastCPUSeconds: Double?
     private var lastSampleTime: CFTimeInterval?
+    private var cachedMetrics: (cpuPercent: Double, residentBytes: UInt64) = (0, 0)
+    private let minimumSampleInterval: CFTimeInterval = 0.75
     private let lock = NSLock()
 
     func sample() -> (cpuPercent: Double, residentBytes: UInt64) {
@@ -413,6 +691,10 @@ private final class ProcessMetricsSampler {
         defer { lock.unlock() }
 
         let now = CACurrentMediaTime()
+        if let lastSampleTime, now - lastSampleTime < minimumSampleInterval {
+            return cachedMetrics
+        }
+
         let cpuSeconds = currentCPUSeconds()
         let cpuPercent: Double
         if let lastCPUSeconds, let lastSampleTime {
@@ -423,8 +705,8 @@ private final class ProcessMetricsSampler {
         }
         lastCPUSeconds = cpuSeconds
         lastSampleTime = now
-
-        return (cpuPercent, currentResidentBytes())
+        cachedMetrics = (cpuPercent, currentResidentBytes())
+        return cachedMetrics
     }
 
     private func currentCPUSeconds() -> Double {

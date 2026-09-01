@@ -2,14 +2,6 @@ import AppKit
 import MetalKit
 import simd
 
-private struct GlyphInstance {
-    var position: SIMD3<Float>
-    var size: SIMD2<Float>
-    var glyph: UInt32
-    var brightness: Float
-    var highlight: Float
-}
-
 private struct Uniforms {
     var viewProjection: simd_float4x4
     var time: Float
@@ -20,24 +12,42 @@ private struct Uniforms {
     var padding: Float
 }
 
-private struct MatrixStrip {
-    var x: Float
-    var y: Float
-    var z: Float
-    var dx: Float
-    var dy: Float
-    var dz: Float
-    var erasing: Bool
-    var spinnerGlyph: Int
-    var spinnerY: Float
-    var spinnerSpeed: Float
-    var glyphs: [Int]
-    var highlights: [Bool]
-    var spinSpeed: Int
-    var spinTick: Int
-    var wavePosition: Int
-    var waveSpeed: Int
-    var waveTick: Int
+private struct FrameResources {
+    var uniformBuffer: MTLBuffer
+}
+
+private struct RendererSimulationBinding {
+    let coordinator: MatrixSimulationCoordinator
+    let consumerToken: UInt64
+    var settings: MatrixSettings
+    var active: Bool
+    let epoch: UInt64
+}
+
+struct MatrixRendererDiagnostics {
+    var submittedFrames: UInt64 = 0
+    var completedFrames: UInt64 = 0
+    var presentedFrames: UInt64 = 0
+    var skippedPresentations: UInt64 = 0
+    var commandErrors: UInt64 = 0
+    var drawableMisses: UInt64 = 0
+    var commandBufferMisses: UInt64 = 0
+    var encoderMisses: UInt64 = 0
+    var resourceMisses: UInt64 = 0
+    var inFlightSkips: UInt64 = 0
+    var inFlightFrames: Int = 0
+    var peakInFlightFrames: Int = 0
+    var instanceCount: Int = 0
+    var instanceCapacity: Int = 0
+    var stripCount: Int = 0
+    var frameSlot: Int = 0
+    var simulationSlot: Int = 0
+    var simulationSequence: UInt64 = 0
+    var drawableSize: CGSize = .zero
+    var gpuMilliseconds: Double = 0
+    var lastPresentedTime: CFTimeInterval = 0
+    var lastError: String?
+    var simulation = MatrixSimulationDiagnostics()
 }
 
 public final class MatrixRenderer: NSObject, MTKViewDelegate {
@@ -50,51 +60,32 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
     private let realCharRows: Float
     private let startTime = CACurrentMediaTime()
     private let isPreview: Bool
-
-    private var settings = MatrixSettings.load()
-    private var strips: [MatrixStrip] = []
-    private var instanceBuffer: MTLBuffer?
-    private var uniformBuffer: MTLBuffer?
-    private var instanceCapacity = 0
-    private var currentSize: CGSize = .zero
-    private var rng: UInt64 = 0x4d6574616c4d6174
-    private var brightnessRamp: [Float] = []
-    private var viewX: Float = 0
-    private var viewY: Float = 0
-    private var lastView = 0
-    private var targetView = 0
-    private var viewSteps = 100
-    private var viewTick = 0
-    private var autoTracking = false
-    private var trackTick = 0
-    private var lastFrameTime: CFTimeInterval = 0
-    private var simulationAccumulator: Double = 0
-
-    private let gridSize = 70
-    private let gridDepth: Float = 35
-    private let waveSize = 22
-    private let splashRatio: Float = 0.7
-    private let niceViews: [(x: Float, y: Float)] = [
-        (0, 0), (0, -20), (0, 20), (25, 0), (-25, 0), (25, 20), (-25, 20), (25, -20), (-25, -20),
-        (10, 0), (-10, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)
-    ]
+    private let simulationLock = NSLock()
+    private var simulationBinding: RendererSimulationBinding?
+    private var nextSimulationEpoch: UInt64 = 1
+    private var frameResources: [FrameResources] = []
+    private var availableFrameSlots: [Int] = []
+    private var frameResourceGeneration: UInt64 = 0
+    private let frameSlotLock = NSLock()
+    private let diagnosticsLock = NSLock()
+    private var diagnostics = MatrixRendererDiagnostics()
+    private let callbackLock = NSLock()
+    private var framePresentedHandler: ((CFTimeInterval) -> Void)?
+    private var framePresentedMinimumInterval: CFTimeInterval = 0
+    private var lastFramePresentedNotification: CFTimeInterval = 0
+    private let maxFramesInFlight = 3
 
     public init(view: MTKView, isPreview: Bool) throws {
         guard let device = view.device else { throw MatrixError.noDevice }
         guard let queue = device.makeCommandQueue() else { throw MatrixError.noCommandQueue }
+        let initialSettings = MatrixSettings.load()
         let library = try device.makeLibrary(source: MatrixRenderer.shaderSource, options: nil)
         guard let vertex = library.makeFunction(name: "matrixVertex"),
               let fragment = library.makeFunction(name: "matrixFragment") else {
             throw MatrixError.noShaderLibrary
         }
 
-        self.device = device
-        self.commandQueue = queue
-        self.isPreview = isPreview
         let atlas = try MatrixRenderer.makeGlyphAtlas(device: device)
-        self.glyphTexture = atlas.texture
-        self.glyphUVSize = atlas.glyphUVSize
-        self.realCharRows = Float(atlas.realCharRows)
 
         let descriptor = MTLRenderPipelineDescriptor()
         descriptor.vertexFunction = vertex
@@ -108,7 +99,7 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
         descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
         descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         descriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
-        self.pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+        let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
 
         let samplerDescriptor = MTLSamplerDescriptor()
         samplerDescriptor.minFilter = .linear
@@ -118,61 +109,153 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
         guard let sampler = device.makeSamplerState(descriptor: samplerDescriptor) else {
             throw MatrixError.noSampler
         }
+
+        let initialFrameResources = try MatrixRenderer.makeFrameResources(device: device,
+                                                                          count: 3)
+        let simulationSession = try MatrixSimulationCoordinatorRegistry.shared.session(
+            device: device,
+            settings: initialSettings,
+            isPreview: isPreview,
+            active: true
+        )
+
+        self.device = device
+        self.commandQueue = queue
+        self.pipeline = pipeline
         self.sampler = sampler
+        self.glyphTexture = atlas.texture
+        self.glyphUVSize = atlas.glyphUVSize
+        self.realCharRows = Float(atlas.realCharRows)
+        self.isPreview = isPreview
+        self.simulationBinding = RendererSimulationBinding(
+            coordinator: simulationSession.coordinator,
+            consumerToken: simulationSession.consumerToken,
+            settings: initialSettings,
+            active: true,
+            epoch: 1
+        )
+        self.frameResources = initialFrameResources
 
         super.init()
-        buildBrightnessRamp()
-        resetTracking()
-        reset(size: view.bounds.size)
+        DebugLifetimeRegistry.shared.register(renderer: self)
+        installFrameResources(initialFrameResources)
+    }
+
+    deinit {
+        shutdown()
+        DebugLifetimeRegistry.shared.unregister(renderer: self)
     }
 
     public func apply(settings newSettings: MatrixSettings) {
-        let shouldReset = settings.density != newSettings.density ||
-            settings.speed != newSettings.speed ||
-            settings.mode != newSettings.mode
-        settings = newSettings
-        if shouldReset {
-            reset(size: currentSize)
+        simulationLock.lock()
+        guard let currentBinding = simulationBinding else {
+            simulationLock.unlock()
+            return
+        }
+        let oldConfiguration = MatrixSimulationConfiguration(device: device,
+                                                              settings: currentBinding.settings,
+                                                              isPreview: isPreview)
+        let newConfiguration = MatrixSimulationConfiguration(device: device,
+                                                              settings: newSettings,
+                                                              isPreview: isPreview)
+        guard oldConfiguration != newConfiguration else {
+            var updatedBinding = currentBinding
+            updatedBinding.settings = newSettings
+            simulationBinding = updatedBinding
+            simulationLock.unlock()
+            return
+        }
+        let expectedEpoch = currentBinding.epoch
+        simulationLock.unlock()
+
+        do {
+            let session = try MatrixSimulationCoordinatorRegistry.shared.session(
+                device: device,
+                settings: newSettings,
+                isPreview: isPreview,
+                active: false
+            )
+
+            simulationLock.lock()
+            guard let latestBinding = simulationBinding,
+                  latestBinding.epoch == expectedEpoch else {
+                simulationLock.unlock()
+                session.coordinator.unregisterConsumer(session.consumerToken)
+                return
+            }
+            nextSimulationEpoch &+= 1
+            if latestBinding.active {
+                session.coordinator.setConsumer(session.consumerToken, active: true)
+            }
+            simulationBinding = RendererSimulationBinding(
+                coordinator: session.coordinator,
+                consumerToken: session.consumerToken,
+                settings: newSettings,
+                active: latestBinding.active,
+                epoch: nextSimulationEpoch
+            )
+            simulationLock.unlock()
+            latestBinding.coordinator.unregisterConsumer(latestBinding.consumerToken)
+        } catch {
+            NSLog("MetalMatrix: unable to rebuild shared simulation ring: \(error)")
         }
     }
 
     public func resume(size: CGSize) {
-        let validSize = size.width > 0 && size.height > 0
-        if strips.isEmpty || instanceBuffer == nil || uniformBuffer == nil {
-            reset(size: validSize ? size : currentSize)
-        } else if validSize && currentSize != size {
-            currentSize = size
+        _ = size
+        if frameResources.count != maxFramesInFlight {
+            if let resources = try? MatrixRenderer.makeFrameResources(device: device,
+                                                                       count: maxFramesInFlight) {
+                installFrameResources(resources)
+            }
         }
+        setSimulationActive(true)
     }
 
     public func resize(size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
-        currentSize = size
+        _ = size
     }
 
-    public func reset(size: CGSize) {
-        currentSize = size
-        lastFrameTime = 0
-        simulationAccumulator = 0
-        resetTracking()
-        let stripCount = min(2_000, max(1, Int(settings.density * 2.2)))
-        strips = (0..<stripCount).map { _ in
-            var strip = makeStrip()
-            strip.erasing = true
-            strip.spinnerY = randomFloat(Float(gridSize))
-            strip.glyphs = Array(repeating: 0, count: gridSize)
-            return strip
+    public func setSimulationActive(_ active: Bool) {
+        simulationLock.lock()
+        guard var binding = simulationBinding,
+              binding.active != active else {
+            simulationLock.unlock()
+            return
         }
+        binding.active = active
+        simulationBinding = binding
+        binding.coordinator.setConsumer(binding.consumerToken, active: active)
+        simulationLock.unlock()
+    }
 
-        let maxGlyphs = stripCount * (gridSize + 1)
-        if maxGlyphs > instanceCapacity {
-            instanceCapacity = maxGlyphs
-            instanceBuffer = device.makeBuffer(length: maxGlyphs * MemoryLayout<GlyphInstance>.stride,
-                                               options: .storageModeShared)
+    public func shutdown() {
+        simulationLock.lock()
+        guard let binding = simulationBinding else {
+            simulationLock.unlock()
+            return
         }
-        if uniformBuffer == nil {
-            uniformBuffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride,
-                                              options: .storageModeShared)
+        simulationBinding = nil
+        nextSimulationEpoch &+= 1
+        simulationLock.unlock()
+        binding.coordinator.unregisterConsumer(binding.consumerToken)
+    }
+
+    public func whenSimulationReady(_ callback: @escaping () -> Void) {
+        simulationLock.lock()
+        guard let binding = simulationBinding else {
+            simulationLock.unlock()
+            return
+        }
+        simulationLock.unlock()
+        binding.coordinator.whenReady { [weak self] in
+            guard let self else { return }
+            self.simulationLock.lock()
+            let isCurrent = self.simulationBinding?.epoch == binding.epoch
+            self.simulationLock.unlock()
+            if isCurrent {
+                callback()
+            }
         }
     }
 
@@ -181,221 +264,282 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
     }
 
     public func draw(in view: MTKView) {
+        guard frameResources.count == maxFramesInFlight else {
+            recordResourceMiss()
+            return
+        }
+        guard let acquiredSlot = acquireFrameSlot() else {
+            recordInFlightSkip()
+            return
+        }
+
+        let frameSlot = acquiredSlot.index
+        let resources = frameResources[frameSlot]
+        simulationLock.lock()
+        let binding = simulationBinding
+        simulationLock.unlock()
+        guard let binding,
+              let sharedFrame = binding.coordinator.acquireFrame(consumer: binding.consumerToken,
+                                                                 at: CACurrentMediaTime()) else {
+            releaseFrameSlot(frameSlot, generation: acquiredSlot.generation)
+            return
+        }
         guard let descriptor = view.currentRenderPassDescriptor,
-              let drawable = view.currentDrawable,
-              let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor),
-              let instanceBuffer,
-              let uniformBuffer else {
+              let drawable = view.currentDrawable else {
+            recordDrawableMiss()
+            sharedFrame.release()
+            releaseFrameSlot(frameSlot, generation: acquiredSlot.generation)
+            return
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            recordCommandBufferMiss()
+            sharedFrame.release()
+            releaseFrameSlot(frameSlot, generation: acquiredSlot.generation)
+            return
+        }
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            recordEncoderMiss()
+            sharedFrame.release()
+            releaseFrameSlot(frameSlot, generation: acquiredSlot.generation)
             return
         }
 
         let time = Float(CACurrentMediaTime() - startTime)
-        advanceSimulationForFrame()
-        let instanceCount = updateInstances(buffer: instanceBuffer)
-
         var uniforms = Uniforms(
-            viewProjection: makeViewProjection(size: view.drawableSize),
+            viewProjection: makeViewProjection(size: view.drawableSize,
+                                               viewX: sharedFrame.viewX,
+                                               viewY: sharedFrame.viewY,
+                                               rotate: binding.settings.rotate),
             time: time,
             viewport: SIMD2(Float(view.drawableSize.width), Float(view.drawableSize.height)),
-            fog: settings.fog ? 1 : 0,
+            fog: binding.settings.fog ? 1 : 0,
             glyphUVSize: glyphUVSize,
             realCharRows: realCharRows,
             padding: 0
         )
-        memcpy(uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
+        memcpy(resources.uniformBuffer.contents(), &uniforms, MemoryLayout<Uniforms>.stride)
 
         encoder.setRenderPipelineState(pipeline)
-        encoder.setVertexBuffer(instanceBuffer, offset: 0, index: 0)
-        encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+        encoder.setVertexBuffer(sharedFrame.instanceBuffer, offset: 0, index: 0)
+        encoder.setVertexBuffer(resources.uniformBuffer, offset: 0, index: 1)
         encoder.setFragmentTexture(glyphTexture, index: 0)
         encoder.setFragmentSamplerState(sampler, index: 0)
-        if instanceCount > 0 {
+        if sharedFrame.instanceCount > 0 {
             encoder.drawPrimitives(type: .triangleStrip,
                                    vertexStart: 0,
                                    vertexCount: 4,
-                                   instanceCount: instanceCount)
+                                   instanceCount: sharedFrame.instanceCount)
         }
         encoder.endEncoding()
+        recordSubmission(instanceCount: sharedFrame.instanceCount,
+                         instanceCapacity: sharedFrame.instanceCapacity,
+                         stripCount: sharedFrame.stripCount,
+                         frameSlot: frameSlot,
+                         simulationSlot: sharedFrame.slotIndex,
+                         simulationSequence: sharedFrame.sequence,
+                         drawableSize: view.drawableSize)
+        drawable.addPresentedHandler { [weak self] drawable in
+            guard drawable.presentedTime > 0 else {
+                self?.recordSkippedPresentation()
+                return
+            }
+            self?.recordPresentation(time: drawable.presentedTime)
+            self?.notifyFramePresented(drawable.presentedTime)
+        }
+        commandBuffer.addCompletedHandler { [weak self, sharedFrame] commandBuffer in
+            self?.recordCompletion(commandBuffer)
+            self?.releaseFrameSlot(frameSlot, generation: acquiredSlot.generation)
+            sharedFrame.release()
+        }
         commandBuffer.present(drawable)
         commandBuffer.commit()
-        frameRendered?(CACurrentMediaTime())
     }
 
-    public var frameRendered: ((CFTimeInterval) -> Void)?
-
-    private func advanceSimulationForFrame() {
-        let now = CACurrentMediaTime()
-        let elapsed: CFTimeInterval
-        if lastFrameTime == 0 {
-            elapsed = 1.0 / 60.0
-        } else {
-            elapsed = min(max(now - lastFrameTime, 0), 0.25)
-        }
-        lastFrameTime = now
-
-        simulationAccumulator += elapsed * 60.0
-        let steps = min(8, Int(simulationAccumulator))
-        guard steps > 0 else { return }
-        simulationAccumulator -= Double(steps)
-        advanceSimulation(steps: steps)
+    func setFramePresentedHandler(minimumInterval: CFTimeInterval,
+                                  handler: ((CFTimeInterval) -> Void)?) {
+        callbackLock.lock()
+        framePresentedHandler = handler
+        framePresentedMinimumInterval = max(0, minimumInterval)
+        lastFramePresentedNotification = 0
+        callbackLock.unlock()
     }
 
-    private func advanceSimulation(steps: Int) {
-        let stepCount = max(1, min(8, steps))
-        for _ in 0..<stepCount {
-            for index in strips.indices {
-                tickStrip(index: index)
-            }
-            autoTrack()
-        }
-    }
-
-    private func updateInstances(buffer: MTLBuffer) -> Int {
-        let pointer = buffer.contents().bindMemory(to: GlyphInstance.self, capacity: instanceCapacity)
-        var count = 0
-        let glyphSize = SIMD2<Float>(1, 1)
-        let sortedIndexes = strips.indices.sorted { strips[$0].z < strips[$1].z }
-
-        for index in sortedIndexes {
-            let strip = strips[index]
-
-            for glyphIndex in 0..<gridSize {
-                let glyph = strip.glyphs[glyphIndex]
-                var below = strip.spinnerY >= Float(glyphIndex)
-                if strip.erasing { below.toggle() }
-                guard glyph != 0 && below && count < instanceCapacity else { continue }
-
-                let brightness = stripBrightness(strip, glyphIndex: glyphIndex, glyph: glyph)
-                pointer[count] = GlyphInstance(
-                    position: SIMD3(strip.x, strip.y - Float(glyphIndex), strip.z),
-                    size: glyphSize,
-                    glyph: UInt32(abs(glyph) - 1),
-                    brightness: brightness,
-                    highlight: strip.highlights[glyphIndex] ? 1 : 0
-                )
-                count += 1
-            }
-
-            if !strip.erasing && count < instanceCapacity {
-                pointer[count] = GlyphInstance(
-                    position: SIMD3(strip.x, strip.y - strip.spinnerY, strip.z),
-                    size: glyphSize,
-                    glyph: UInt32(abs(strip.spinnerGlyph) - 1),
-                    brightness: glyphBrightness(glyph: strip.spinnerGlyph, highlight: false, z: strip.z, baseBrightness: 1),
-                    highlight: 0
-                )
-                count += 1
-            }
-        }
-
-        return count
-    }
-
-    private func makeStrip() -> MatrixStrip {
-        var glyphs = Array(repeating: 0, count: gridSize)
-        var highlights = Array(repeating: false, count: gridSize)
-
-        for index in 0..<gridSize {
-            let draw = randomInt(7) != 0
-            let spin = draw && randomInt(20) == 0
-            var glyph = draw ? randomGlyph() + 1 : 0
-            if spin { glyph = -glyph }
-            glyphs[index] = glyph
-            highlights[index] = false
-        }
-
-        let speed = max(settings.speed, 0.1)
-        return MatrixStrip(
-            x: randomFloat(Float(gridSize)) - Float(gridSize) / 2,
-            y: Float(gridSize) / 2 + bellRandom(0.5),
-            z: gridDepth * 0.2 - randomFloat(gridDepth * 0.7),
-            dx: 0,
-            dy: 0,
-            dz: bellRandom(0.02) * speed,
-            erasing: false,
-            spinnerGlyph: -(randomGlyph() + 1),
-            spinnerY: 0,
-            spinnerSpeed: bellRandom(0.3) * speed,
-            glyphs: glyphs,
-            highlights: highlights,
-            spinSpeed: max(1, Int(bellRandom(2 / speed)) + 1),
-            spinTick: 0,
-            wavePosition: 0,
-            waveSpeed: max(1, Int(bellRandom(3 / speed)) + 1),
-            waveTick: 0
-        )
-    }
-
-    private func tickStrip(index: Int) {
-        strips[index].x += strips[index].dx
-        strips[index].y += strips[index].dy
-        strips[index].z += strips[index].dz
-
-        if strips[index].z > gridDepth * splashRatio {
-            strips[index] = makeStrip()
+    private func notifyFramePresented(_ time: CFTimeInterval) {
+        callbackLock.lock()
+        guard framePresentedHandler != nil,
+              lastFramePresentedNotification == 0 ||
+              time - lastFramePresentedNotification >= framePresentedMinimumInterval else {
+            callbackLock.unlock()
             return
         }
+        let callback = framePresentedHandler
+        lastFramePresentedNotification = time
+        callbackLock.unlock()
+        callback?(time)
+    }
 
-        strips[index].spinnerY += strips[index].spinnerSpeed
-        if strips[index].spinnerY >= Float(gridSize) {
-            if strips[index].erasing {
-                strips[index] = makeStrip()
-                return
-            } else {
-                strips[index].erasing = true
-                strips[index].spinnerY = 0
-                strips[index].spinnerSpeed /= 2
+    func diagnosticsSnapshot() -> MatrixRendererDiagnostics {
+        diagnosticsLock.lock()
+        var snapshot = diagnostics
+        diagnosticsLock.unlock()
+        simulationLock.lock()
+        let coordinator = simulationBinding?.coordinator
+        simulationLock.unlock()
+        if let coordinator {
+            snapshot.simulation = coordinator.diagnosticsSnapshot()
+        }
+        return snapshot
+    }
+
+    private func recordSubmission(instanceCount: Int,
+                                  instanceCapacity: Int,
+                                  stripCount: Int,
+                                  frameSlot: Int,
+                                  simulationSlot: Int,
+                                  simulationSequence: UInt64,
+                                  drawableSize: CGSize) {
+        diagnosticsLock.lock()
+        diagnostics.submittedFrames &+= 1
+        diagnostics.instanceCount = instanceCount
+        diagnostics.instanceCapacity = instanceCapacity
+        diagnostics.stripCount = stripCount
+        diagnostics.frameSlot = frameSlot
+        diagnostics.simulationSlot = simulationSlot
+        diagnostics.simulationSequence = simulationSequence
+        diagnostics.drawableSize = drawableSize
+        diagnosticsLock.unlock()
+    }
+
+    private func recordCompletion(_ commandBuffer: MTLCommandBuffer) {
+        diagnosticsLock.lock()
+        diagnostics.completedFrames &+= 1
+        if commandBuffer.status == .error {
+            diagnostics.commandErrors &+= 1
+            diagnostics.lastError = commandBuffer.error.map { sanitizeDiagnostic($0.localizedDescription) } ?? "unknown Metal error"
+        }
+        let duration = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+        if duration.isFinite && duration >= 0 {
+            diagnostics.gpuMilliseconds = duration * 1_000
+        }
+        diagnosticsLock.unlock()
+    }
+
+    private func recordInFlightAcquired() {
+        diagnosticsLock.lock()
+        diagnostics.inFlightFrames += 1
+        diagnostics.peakInFlightFrames = max(diagnostics.peakInFlightFrames, diagnostics.inFlightFrames)
+        diagnosticsLock.unlock()
+    }
+
+    private func recordInFlightReleased() {
+        diagnosticsLock.lock()
+        diagnostics.inFlightFrames = max(0, diagnostics.inFlightFrames - 1)
+        diagnosticsLock.unlock()
+    }
+
+    private func recordInFlightSkip() {
+        diagnosticsLock.lock()
+        diagnostics.inFlightSkips &+= 1
+        diagnosticsLock.unlock()
+    }
+
+    private func recordPresentation(time: CFTimeInterval) {
+        diagnosticsLock.lock()
+        diagnostics.presentedFrames &+= 1
+        diagnostics.lastPresentedTime = time
+        diagnosticsLock.unlock()
+    }
+
+    private func recordSkippedPresentation() {
+        diagnosticsLock.lock()
+        diagnostics.skippedPresentations &+= 1
+        diagnosticsLock.unlock()
+    }
+
+    private func recordDrawableMiss() {
+        diagnosticsLock.lock()
+        diagnostics.drawableMisses &+= 1
+        diagnosticsLock.unlock()
+    }
+
+    private func recordCommandBufferMiss() {
+        diagnosticsLock.lock()
+        diagnostics.commandBufferMisses &+= 1
+        diagnosticsLock.unlock()
+    }
+
+    private func recordEncoderMiss() {
+        diagnosticsLock.lock()
+        diagnostics.encoderMisses &+= 1
+        diagnosticsLock.unlock()
+    }
+
+    private func recordResourceMiss() {
+        diagnosticsLock.lock()
+        diagnostics.resourceMisses &+= 1
+        diagnosticsLock.unlock()
+    }
+
+    private func sanitizeDiagnostic(_ text: String) -> String {
+        let singleLine = text.replacingOccurrences(of: "\n", with: " ")
+        return String(singleLine.prefix(120))
+    }
+
+    private static func makeFrameResources(device: MTLDevice,
+                                           count: Int) throws -> [FrameResources] {
+        var resources: [FrameResources] = []
+        resources.reserveCapacity(count)
+        for _ in 0..<count {
+            guard let uniformBuffer = device.makeBuffer(
+                length: MemoryLayout<Uniforms>.stride,
+                options: .storageModeShared
+            ) else {
+                throw MatrixError.noUniformBuffer
             }
+            resources.append(FrameResources(uniformBuffer: uniformBuffer))
         }
-
-        strips[index].spinTick += 1
-        if strips[index].spinTick > strips[index].spinSpeed {
-            strips[index].spinTick = 0
-            strips[index].spinnerGlyph = -(randomGlyph() + 1)
-            for glyphIndex in 0..<strips[index].glyphs.count where strips[index].glyphs[glyphIndex] < 0 {
-                strips[index].glyphs[glyphIndex] = -(randomGlyph() + 1)
-                if randomInt(800) == 0 {
-                    strips[index].glyphs[glyphIndex] = -strips[index].glyphs[glyphIndex]
-                }
-            }
-        }
-
-        strips[index].waveTick += 1
-        if strips[index].waveTick > strips[index].waveSpeed {
-            strips[index].waveTick = 0
-            strips[index].wavePosition = (strips[index].wavePosition + 1) % waveSize
-        }
+        return resources
     }
 
-    private func stripBrightness(_ strip: MatrixStrip, glyphIndex: Int, glyph: Int) -> Float {
-        let base: Float
-        if settings.waves {
-            let rampIndex = waveSize - ((glyphIndex + (gridSize - strip.wavePosition)) % waveSize)
-            base = brightnessRamp[max(0, min(waveSize - 1, rampIndex))]
-        } else {
-            base = 1
-        }
-        return glyphBrightness(glyph: glyph, highlight: strip.highlights[glyphIndex], z: strip.z, baseBrightness: base)
+    private func installFrameResources(_ resources: [FrameResources]) {
+        frameResources = resources
+        frameSlotLock.lock()
+        frameResourceGeneration &+= 1
+        availableFrameSlots = Array(resources.indices)
+        frameSlotLock.unlock()
+
+        diagnosticsLock.lock()
+        diagnostics.inFlightFrames = 0
+        diagnosticsLock.unlock()
     }
 
-    private func glyphBrightness(glyph: Int, highlight: Bool, z: Float, baseBrightness: Float) -> Float {
-        var brightness = baseBrightness
-        if glyph < 0 { brightness *= 1.5 }
-        if settings.fog {
-            let depth = 0.2 + (((z / gridDepth) + 0.5) * 0.8)
-            brightness *= depth
+    private func acquireFrameSlot() -> (index: Int, generation: UInt64)? {
+        frameSlotLock.lock()
+        guard let index = availableFrameSlots.popLast() else {
+            frameSlotLock.unlock()
+            return nil
         }
-        if highlight { brightness *= 2 }
-        if z > gridDepth / 2 {
-            let ratio = (z - gridDepth / 2) / ((gridDepth * splashRatio) - gridDepth / 2)
-            let index = max(0, min(waveSize - 1, Int(ratio * Float(waveSize))))
-            brightness *= brightnessRamp[index]
-        }
-        return min(brightness, 3)
+        let generation = frameResourceGeneration
+        frameSlotLock.unlock()
+        recordInFlightAcquired()
+        return (index, generation)
     }
 
-    private func makeViewProjection(size: CGSize) -> simd_float4x4 {
+    private func releaseFrameSlot(_ index: Int, generation: UInt64) {
+        frameSlotLock.lock()
+        guard generation == frameResourceGeneration else {
+            frameSlotLock.unlock()
+            return
+        }
+        availableFrameSlots.append(index)
+        frameSlotLock.unlock()
+        recordInFlightReleased()
+    }
+
+    private func makeViewProjection(size: CGSize,
+                                    viewX: Float,
+                                    viewY: Float,
+                                    rotate: Bool) -> simd_float4x4 {
         let width = Float(max(size.width, 1))
         let height = Float(max(size.height, 1))
         let aspect = width / height
@@ -403,7 +547,7 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
         let camera = simd_float4x4.lookAt(eye: SIMD3<Float>(0, 0, 25),
                                           center: SIMD3<Float>(0, 0, 0),
                                           up: SIMD3<Float>(0, 1, 0))
-        let rotation = settings.rotate
+        let rotation = rotate
             ? simd_float4x4.rotation(radians: viewY * .pi / 180, axis: SIMD3<Float>(0, 1, 0)) *
               simd_float4x4.rotation(radians: viewX * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
             : matrix_identity_float4x4
@@ -454,84 +598,6 @@ public final class MatrixRenderer: NSObject, MTKViewDelegate {
         return (texture, SIMD2(Float(charWidth) / Float(atlas.width), Float(charHeight) / Float(atlas.height)), realRows)
     }
 
-    private func buildBrightnessRamp() {
-        brightnessRamp = (0..<waveSize).map { index in
-            var value = Float(waveSize - index) / Float(waveSize - 1)
-            value *= .pi / 2
-            value = sinf(value)
-            return 0.2 + value * 0.8
-        }
-    }
-
-    private func resetTracking() {
-        lastView = 0
-        targetView = 0
-        viewX = niceViews[0].x
-        viewY = niceViews[0].y
-        viewSteps = 100
-        viewTick = 0
-        autoTracking = false
-        trackTick = 0
-    }
-
-    private func autoTrack() {
-        guard settings.rotate else { return }
-        if !autoTracking {
-            trackTick += 1
-            guard trackTick >= Int(20 / max(settings.speed, 0.1)) else { return }
-            trackTick = 0
-            guard randomInt(20) == 0 else { return }
-            autoTracking = true
-        }
-
-        let origin = niceViews[lastView]
-        let target = niceViews[targetView]
-        let theta = sinf((.pi / 2) * Float(viewTick) / Float(viewSteps))
-        viewX = origin.x + (target.x - origin.x) * theta
-        viewY = origin.y + (target.y - origin.y) * theta
-        viewTick += 1
-
-        if viewTick >= viewSteps {
-            viewTick = 0
-            viewSteps = max(1, Int(350 / max(settings.speed, 0.1)))
-            lastView = targetView
-            targetView = randomInt(niceViews.count - 1) + 1
-            autoTracking = false
-        }
-    }
-
-    private func randomGlyph() -> Int {
-        let glyphs: [Int]
-        switch settings.mode {
-        case .matrix:
-            glyphs = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175]
-        case .binary:
-            glyphs = [16, 17]
-        case .hexadecimal:
-            glyphs = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 33, 34, 35, 36, 37, 38]
-        case .dna:
-            glyphs = [33, 35, 39, 52]
-        }
-        return glyphs[randomInt(glyphs.count)]
-    }
-
-    private func randomInt(_ upperBound: Int) -> Int {
-        guard upperBound > 0 else { return 0 }
-        return Int(nextRandom() % UInt64(upperBound))
-    }
-
-    private func randomFloat(_ upperBound: Float) -> Float {
-        Float(nextRandom() & 0x00ff_ffff) / Float(0x0100_0000) * upperBound
-    }
-
-    private func bellRandom(_ upperBound: Float) -> Float {
-        (randomFloat(upperBound) + randomFloat(upperBound) + randomFloat(upperBound)) / 3
-    }
-
-    private func nextRandom() -> UInt64 {
-        rng = rng &* 6364136223846793005 &+ 1442695040888963407
-        return rng
-    }
 }
 
 private enum MatrixError: Error {
@@ -539,6 +605,7 @@ private enum MatrixError: Error {
     case noCommandQueue
     case noShaderLibrary
     case noSampler
+    case noUniformBuffer
     case noGlyphTexture
     case missingXPMResource
     case invalidXPM
@@ -720,9 +787,8 @@ private extension MatrixRenderer {
     fragment float4 matrixFragment(VertexOut in [[stage_in]],
                                    texture2d<float> glyphTexture [[texture(0)]],
                                    sampler glyphSampler [[sampler(0)]]) {
-        float alpha = glyphTexture.sample(glyphSampler, in.uv).a;
         float4 sample = glyphTexture.sample(glyphSampler, in.uv);
-        return float4(sample.rgb, clamp(alpha * in.brightness, 0.0, 1.0));
+        return float4(sample.rgb, clamp(sample.a * in.brightness, 0.0, 1.0));
     }
     """
 }

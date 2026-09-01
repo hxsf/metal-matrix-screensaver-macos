@@ -75,13 +75,30 @@ is intentionally ignored by git; place it at the repository root as
 `dist/` and `.build/` are generated output and are not tracked. Rebuild the
 screen saver with `./script/build_saver.sh`.
 
-The frame rate setting applies to the `ScreenSaverView` animation interval and
-the backing `MTKView` preferred frame rate. Display sleep pausing is evaluated
-per screen, so multi-display screen saver views stop independently when their
-own display is asleep or unavailable.
+The frame rate setting controls the backing `MTKView` preferred frame rate.
+Animation speed is advanced from elapsed time, so lower frame-rate limits do
+not slow down the effect. Display sleep pausing is evaluated per screen, so
+multi-display screen saver views stop independently when their own display is
+asleep or unavailable. Dynamic glyph instances are prepared once for all active
+displays on a shared utility-QoS ring. The producer refills from four to twelve
+ready snapshots, and each display keeps three small uniform buffers for
+independent Metal submission and presentation. Ring slots are reused only after
+they fall behind the newest due snapshot and all GPU readers have completed;
+slow displays skip stale snapshots instead of blocking the producer.
+Metal views and renderers are created only after
+an active screen saver view is attached to a window, then released from
+`stopAnimation()` because the macOS legacy host can keep stopped view objects
+alive for later reuse.
 
 The debug overlay reports per-display FPS as seen by each screen saver view.
-CPU and memory are sampled for the current process. Metal exposes the current
+It also distinguishes submitted, GPU-completed, and actually presented frames,
+and reports instance counts, drawable size, in-flight frames, Metal errors,
+resource misses, actual/preferred GPU registry IDs, and live view/renderer
+counts. CPU and memory are sampled once per interval for the current process,
+so every display reports the same process-wide snapshot. CPU uses Activity
+Monitor's convention where 100% equals one fully occupied logical core; the
+overlay also shows the value normalized across all active logical cores.
+Metal exposes the current
 device allocation size through `MTLDevice.currentAllocatedSize`, so the overlay
 shows that as `GMEM self`. Real-time global GPU utilization is not available
 through a stable public Metal API, so it is displayed as `GPU global n/a`.
