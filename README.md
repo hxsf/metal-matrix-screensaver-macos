@@ -13,6 +13,15 @@ The renderer is based on the original `xscreensaver` GLMatrix behavior:
 The bundle identifier and product name are intentionally different from the
 legacy OpenGL saver so both can coexist during testing.
 
+## Compatibility
+
+- macOS 11 Big Sur or later
+- Apple Silicon (`arm64`) and Intel (`x86_64`)
+
+Release bundles are universal binaries. The declared minimum system version and
+the Mach-O deployment target are both validated as macOS 11.0 during release
+builds.
+
 ## Build
 
 ```sh
@@ -30,6 +39,18 @@ By default the script builds a universal `arm64 + x86_64` Mach-O bundle. To buil
 ```sh
 ARCHS=arm64 ./script/build_saver.sh
 ```
+
+Pushing a semantic version tag such as `v3.16.0` runs the GitHub Actions release
+workflow. It builds and validates the screen saver, creates a GitHub Release,
+and uploads the universal zip plus its SHA-256 checksum. The tag must exactly
+match both `CFBundleShortVersionString` and `CFBundleVersion` in
+`Resources/Info.plist`. The workflow can also be started manually to produce a
+downloadable Actions artifact without publishing a Release.
+
+Automated artifacts are ad-hoc signed for bundle integrity, but are not signed
+with an Apple Developer ID or notarized. Developer ID signing and notarization
+require certificate and App Store Connect credentials configured as repository
+secrets.
 
 ## Install
 
