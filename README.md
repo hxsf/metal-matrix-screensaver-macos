@@ -45,7 +45,9 @@ workflow. It builds and validates the screen saver, creates a GitHub Release,
 and uploads the universal zip plus its SHA-256 checksum. The tag must exactly
 match both `CFBundleShortVersionString` and `CFBundleVersion` in
 `Resources/Info.plist`. The workflow can also be started manually to produce a
-downloadable Actions artifact without publishing a Release.
+downloadable Actions artifact. Leave `publish_tag` empty for artifact-only mode,
+or provide an existing semantic tag such as `v3.16.0` to create or update that
+GitHub Release directly from the workflow.
 
 Automated artifacts are ad-hoc signed for bundle integrity, but are not signed
 with an Apple Developer ID or notarized. Developer ID signing and notarization
